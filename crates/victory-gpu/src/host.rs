@@ -42,6 +42,8 @@ const RTV_RING: u32 = 1024;
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
     pub(crate) depth_bounds_supported: bool,
+    /// DXGI vendor id of the adapter (0x10DE = NVIDIA).
+    pub(crate) vendor_id: u32,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
@@ -182,19 +184,59 @@ fn create() -> windows::core::Result<Host> {
             }
         }
         let mut device: Option<ID3D12Device> = None;
+        let mut vendor_id: u32 = 0;
+        let mut adapter_name = String::new();
         // Diagnostics: the software adapter, on which a shader's wild access
         // is an access violation in this process (a crash report with the
         // address and instruction) instead of a GPU fault and driver reset.
         if cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_WARP") {
             let adapter = warp_adapter()?;
+            if let Ok(desc) = adapter.cast::<IDXGIAdapter1>().and_then(|a| a.GetDesc1()) {
+                vendor_id = desc.VendorId;
+                adapter_name = String::from_utf16_lossy(&desc.Description)
+                    .trim_end_matches('\0')
+                    .trim()
+                    .to_owned();
+            }
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
-            tracing::info!("host device on the software adapter (WARP)");
+            tracing::info!(adapter = %adapter_name, "host device on the software adapter (WARP)");
         } else {
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            // Prefer the hardware adapter with the most dedicated VRAM so a
+            // discrete NVIDIA/AMD GPU is picked on hybrid systems.
+            match hardware_adapter() {
+                Ok(adapter) => {
+                    if let Ok(desc) = adapter.GetDesc1() {
+                        vendor_id = desc.VendorId;
+                        adapter_name = String::from_utf16_lossy(&desc.Description)
+                            .trim_end_matches('\0')
+                            .trim()
+                            .to_owned();
+                    }
+                    D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+                }
+                Err(_) => {
+                    D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+                }
+            }
             // Whether a GPU hang ends the run or freezes the PC (#1054).
             crate::tdr::log();
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
+        if vendor_id == 0 {
+            // Fallback path used the default adapter; identify it.
+            if let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0)) {
+                let luid = device.GetAdapterLuid();
+                if let Ok(adapter) = factory.EnumAdapterByLuid::<IDXGIAdapter1>(luid) {
+                    if let Ok(desc) = adapter.GetDesc1() {
+                        vendor_id = desc.VendorId;
+                        adapter_name = String::from_utf16_lossy(&desc.Description)
+                            .trim_end_matches('\0')
+                            .trim()
+                            .to_owned();
+                    }
+                }
+            }
+        }
         let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS2::default();
         let depth_bounds_supported = device
             .CheckFeatureSupport(
@@ -235,7 +277,14 @@ fn create() -> windows::core::Result<Host> {
             })?;
         let cpu_view_size =
             device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-        tracing::info!("host D3D12 device ready");
+        let nvidia = vendor_id == 0x10DE;
+        tracing::info!(
+            adapter = %adapter_name,
+            vendor = format_args!("{vendor_id:#x}"),
+            nvidia,
+            depth_bounds_supported,
+            "host D3D12 device ready"
+        );
         // The console fuses its multiply-adds (`v_fma_f32`, `v_fmac_f32`,
         // `v_fma_mix*`); the lowering's DXIL `FMad` is fused only where the
         // host chooses (the RX 6700 XT does, WARP does not).
@@ -250,6 +299,7 @@ fn create() -> windows::core::Result<Host> {
         Ok(Host {
             device,
             depth_bounds_supported,
+            vendor_id,
             queue,
             fence,
             submitted: Mutex::new(0),
@@ -281,6 +331,39 @@ fn process_memory() -> (u64, u64) {
     // SAFETY: our own process and a sized structure.
     unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
     (c.PagefileUsage as u64, c.WorkingSetSize as u64)
+}
+
+/// The hardware adapter with the most dedicated video memory, so a discrete
+/// NVIDIA/AMD GPU is preferred over an integrated one on hybrid systems.
+/// Software adapters (WARP, basic render driver) are skipped.
+fn hardware_adapter() -> windows::core::Result<IDXGIAdapter1> {
+    // SAFETY: plain DXGI adapter enumeration.
+    unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+        let mut best: Option<(IDXGIAdapter1, usize)> = None;
+        for index in 0.. {
+            let Ok(adapter) = factory.EnumAdapters1(index) else {
+                break;
+            };
+            let Ok(desc) = adapter.GetDesc1() else {
+                continue;
+            };
+            let software = desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0;
+            if software || desc.DedicatedVideoMemory == 0 {
+                continue;
+            }
+            let vram = desc.DedicatedVideoMemory;
+            if best.as_ref().is_none_or(|(_, best_vram)| vram > *best_vram) {
+                best = Some((adapter, vram));
+            }
+        }
+        best.map(|(a, _)| a).ok_or_else(|| {
+            windows::core::Error::new(
+                windows::Win32::Foundation::E_FAIL,
+                "no hardware adapter",
+            )
+        })
+    }
 }
 
 /// DXGI may return hardware for `EnumWarpAdapter` (notably under Proton).
@@ -1033,6 +1116,11 @@ struct Deferred {
 }
 
 impl Host {
+    /// Whether the host GPU is an NVIDIA adapter (vendor 0x10DE).
+    pub(crate) fn is_nvidia(&self) -> bool {
+        self.vendor_id == 0x10DE
+    }
+
     /// Whether the host runs mesh shaders at shader model 6.6 (translated
     /// mesh shaders need both); logged once.
     pub(crate) fn mesh_shaders(&self) -> bool {
