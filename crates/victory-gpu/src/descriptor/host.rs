@@ -150,24 +150,49 @@ impl HostHeap {
                     return None;
                 }
             }
-        } else if let Ok(heap) = make((count + DYNAMIC).max(views)) {
-            (heap, count, DYNAMIC)
         } else {
-            // shortcut: a host that caps its heaps below `HEAP_VIEWS` (NVIDIA)
-            // faults on an index past them, as before the clamp.
-            match make(count + MIN_DYNAMIC) {
-                Ok(heap) => (heap, count, MIN_DYNAMIC),
-                Err(e) if count + MIN_DYNAMIC > PORTABLE_VIEWS => {
-                    // shortcut: descriptors past the host's limit are left
-                    // out; a title that reaches them needs remapping.
+            let large = (count + DYNAMIC).max(views);
+            // NVIDIA Tier 1/2 caps shader-visible CBV/SRV/UAV heaps at 1,000,000
+            // descriptors. Skip the oversized attempt to avoid a guaranteed
+            // CreateDescriptorHeap failure on startup.
+            let tier1or2 = large > PORTABLE_VIEWS && {
+                let mut opts = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+                // SAFETY: opts is a valid D3D12 feature struct.
+                let ok = unsafe {
+                    host.device.CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS,
+                        (&raw mut opts).cast(),
+                        size_of_val(&opts) as u32,
+                    )
+                }
+                .is_ok();
+                ok && opts.ResourceBindingTier < D3D12_RESOURCE_BINDING_TIER_3
+            };
+            let capped = |e: windows::core::Error| {
+                if count + MIN_DYNAMIC > PORTABLE_VIEWS {
                     tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                    (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC)
-                }
-                Err(e) => {
+                    make(PORTABLE_VIEWS).ok().map(|heap| (heap, PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC))
+                } else {
                     tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
-                    return None;
+                    None
                 }
-            }
+            };
+            let result = if tier1or2 {
+                match make(count + MIN_DYNAMIC) {
+                    Ok(heap) => Some((heap, count, MIN_DYNAMIC)),
+                    Err(e) => capped(e),
+                }
+            } else {
+                match make(large) {
+                    Ok(heap) => Some((heap, count, DYNAMIC)),
+                    Err(_) => match make(count + MIN_DYNAMIC) {
+                        Ok(heap) => Some((heap, count, MIN_DYNAMIC)),
+                        Err(e) => capped(e),
+                    },
+                }
+            };
+            let Some(result) = result else { return None };
+            result
         };
         // SAFETY: a live heap.
         let (cpu, step) = unsafe {
