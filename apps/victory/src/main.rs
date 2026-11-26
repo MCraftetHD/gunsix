@@ -10,6 +10,17 @@ mod run;
 mod shader;
 mod translate;
 
+/// Hint hybrid-GPU drivers to prefer the discrete (high-performance) GPU.
+/// This helps NVIDIA Optimus and AMD PowerXpress systems pick the dGPU.
+#[cfg(windows)]
+#[no_mangle]
+#[used]
+pub static NvOptimusEnablement: u32 = 0x0000_0001;
+#[cfg(windows)]
+#[no_mangle]
+#[used]
+pub static AmdPowerXpressRequestHighPerformance: u32 = 0x0000_0001;
+
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
